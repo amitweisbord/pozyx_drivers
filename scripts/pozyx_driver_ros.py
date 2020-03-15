@@ -13,17 +13,25 @@ from sensor_msgs.msg import FluidPressure
 class ReadyToLocalize(object):
 
     #def __init__(self, pozyx, anchors, algorithm=POZYX_POS_ALG_LS, dimension=POZYX_3D, height=1000):
-    def __init__(self, pozyx, anchors, do_ranging_attempts, world_frame_id, tag_frame_id, tag_device_id, algorithm=POZYX_POS_ALG_TRACKING, dimension=POZYX_3D, height=1000):
+    def __init__(self, pozyx, anchors, do_ranging_attempts, world_frame_id, tag_frame_id, tag_device_id, pub_with_dev_ids, algorithm=POZYX_POS_ALG_TRACKING, dimension=POZYX_3D, height=1000):
+        # initiate variables
         self.pozyx = pozyx
         self.anchors = anchors
         self.algorithm = algorithm
         self.dimension = dimension
         self.height = height
-        self.range_error_counts = [0 for i in xrange(len(self.anchors))]
+        self.range_error_counts = [0 for _ in xrange(len(self.anchors))]
         self.world_frame_id = world_frame_id
-        self.tag_frame_id = tag_frame_id
+        self.device_id_string = '_'+hex(tag_device_id) if pub_with_dev_ids else ''
+        self.tag_frame_id = tag_frame_id+self.device_id_string
         self.tag_device_id = tag_device_id
         self.do_ranging_attempts = do_ranging_attempts
+
+        # Create tag topic publishers
+        self.pub_pose = rospy.Publisher('~pose'+self.device_id_string, PoseStamped , queue_size=1)
+        self.pub_pose_with_cov = rospy.Publisher('~pose_with_cov'+self.device_id_string, PoseWithCovarianceStamped, queue_size=1)
+        self.pub_imu = rospy.Publisher('~imu'+self.device_id_string, Imu, queue_size=1)
+        self.pub_pressure = rospy.Publisher('~pressure'+self.device_id_string, FluidPressure , queue_size=1)
 
     def setup(self):
         self.setAnchorsManual()
@@ -31,7 +39,7 @@ class ReadyToLocalize(object):
 
     def loop(self):
 
-        #Topic 1: PoseWitchCovariance
+        #Topic 1: PoseWithCovariance
         pwc = PoseWithCovarianceStamped()
         pwc.header.stamp = rospy.get_rostime()
         pwc.header.frame_id = self.world_frame_id
@@ -58,7 +66,7 @@ class ReadyToLocalize(object):
         pwc.pose.pose.position.z = pwc.pose.pose.position.z * 0.001
 
         if status == POZYX_SUCCESS:
-            pub_pose_with_cov.publish(pwc)
+            self.pub_pose_with_cov.publish(pwc)
 
         #Topic 2: IMU
         imu = Imu()
@@ -85,7 +93,7 @@ class ReadyToLocalize(object):
         imu.angular_velocity.y = imu.angular_velocity.y * 0.01745
         imu.angular_velocity.z = imu.angular_velocity.z * 0.01745
 
-        pub_imu.publish(imu)
+        self.pub_imu.publish(imu)
 
         #Topic 3: Anchors Info
         for i in range(len(anchors)):
@@ -152,7 +160,7 @@ class ReadyToLocalize(object):
         ps.pose.position = pwc.pose.pose.position
         ps.pose.orientation =  pwc.pose.pose.orientation
 
-        pub_pose.publish(ps)
+        self.pub_pose.publish(ps)
 
         #Topic 5: Pressure
         pr = FluidPressure()
@@ -164,7 +172,7 @@ class ReadyToLocalize(object):
         pr.fluid_pressure = pressure.value
         pr.variance = 0
 
-        pub_pressure.publish(pr)
+        self.pub_pressure.publish(pr)
 
     def setAnchorsManual(self):
         status = self.pozyx.clearDevices()
@@ -200,7 +208,9 @@ if __name__ == "__main__":
     serial_port = rospy.get_param('~serial_port', '/dev/ttyACM0')
 
     num_anchors = int(rospy.get_param('~num_anchors', 4))
-    tag_device_id = eval((rospy.get_param('~tag_device_id', 'None')))
+    tag_dev_ids_list = [int(item, 16) for item in (rospy.get_param('~tag_device_id', '')).split()]
+    tag_dev_ids_list = tag_dev_ids_list if tag_dev_ids_list else [None]
+    pub_with_dev_ids = bool((rospy.get_param('~pub_with_dev_ids', False)))
 
     anchor_id = []
     anchor_coordinates = []
@@ -217,7 +227,6 @@ if __name__ == "__main__":
     dimension = int(rospy.get_param('~dimension'))
     height    = int(rospy.get_param('~height'))
     frequency = int(rospy.get_param('~frequency'))
-
     world_frame_id = rospy.get_param('~world_frame_id', 'world')
     tag_frame_id = rospy.get_param('~tag_frame_id', 'pozyx_tag')
 
@@ -225,10 +234,7 @@ if __name__ == "__main__":
     if do_ranging_attempts < 1:
         do_ranging_attempts = 1
 
-    # Creating publishers
-    pub_pose_with_cov = rospy.Publisher('~pose_with_cov', PoseWithCovarianceStamped, queue_size=1)
-    pub_imu = rospy.Publisher('~imu', Imu, queue_size=1)
-
+    # Creating anchor publishers
     anchors = []
     for i in range(num_anchors):
         anchors.append(DeviceCoordinates(anchor_id[i], 1, Coordinates(anchor_coordinates[i][0], anchor_coordinates[i][1], anchor_coordinates[i][2])))
@@ -239,15 +245,17 @@ if __name__ == "__main__":
         topic_name = "~anchor_info_" + str(i)
         pub_anchor_info.append(rospy.Publisher(topic_name, AnchorInfo, queue_size=1))
 
-    pub_pose = rospy.Publisher('~pose', PoseStamped , queue_size=1)
-    pub_pressure = rospy.Publisher('~pressure', FluidPressure , queue_size=1)
-
     rate = rospy.Rate(frequency)
 
     # Starting communication with Pozyx
     pozyx = PozyxSerial(serial_port)
-    rdl = ReadyToLocalize(pozyx, anchors, do_ranging_attempts, world_frame_id, tag_frame_id, tag_device_id, algorithm, dimension, height)
-    rdl.setup()
+
+    # Creating tag instances
+    rdl = [ReadyToLocalize(pozyx, anchors, do_ranging_attempts, world_frame_id, tag_frame_id, tag_device_id, pub_with_dev_ids, algorithm, dimension, height
+    ) for tag_device_id in tag_dev_ids_list]
+    for rdli in rdl:
+        rdli.setup()
     while not rospy.is_shutdown():
-        rdl.loop()
+        for rdli in rdl:
+            rdli.loop()
         rate.sleep()
